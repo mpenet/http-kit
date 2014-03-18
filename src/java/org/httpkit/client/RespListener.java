@@ -1,6 +1,6 @@
 package org.httpkit.client;
 
-import static org.httpkit.HttpUtils.CONTENT_ENCODING;
+import org.httpkit.*;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -12,39 +12,37 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
 
-import org.httpkit.*;
+import static org.httpkit.HttpUtils.CONTENT_ENCODING;
+import static org.httpkit.HttpUtils.CONTENT_TYPE;
 
 class Handler implements Runnable {
 
     private final int status;
-    private final Map<String, String> headers;
+    private final Map<String, Object> headers;
     private final Object body;
-    private final Throwable e;
     private final IResponseHandler handler;
 
-    public Handler(IResponseHandler handler, int status, Map<String, String> headers,
-            Object body, Throwable e) {
+    public Handler(IResponseHandler handler, int status, Map<String, Object> headers,
+                   Object body) {
+        this.handler = handler;
         this.status = status;
         this.headers = headers;
         this.body = body;
-        this.e = e;
-        this.handler = handler;
     }
 
     public Handler(IResponseHandler handler, Throwable e) {
-        this(handler, 0, null, null, e);
-    }
-
-    public Handler(IResponseHandler handler, int status, Map<String, String> headers,
-            Object body) {
-        this(handler, status, headers, body, null);
+        this(handler, 0, null, e);
     }
 
     public void run() {
-        if (e != null) {
-            handler.onThrowable(e);
-        } else {
-            handler.onSuccess(status, headers, body);
+        try {
+            if (body instanceof Throwable) {
+                handler.onThrowable((Throwable) body);
+            } else {
+                handler.onSuccess(status, headers, body);
+            }
+        } catch (Exception e) { // onSuccess may throw Exception
+            handler.onThrowable(e); // should not throw exception
         }
     }
 }
@@ -55,22 +53,22 @@ class Handler implements Runnable {
 public class RespListener implements IRespListener {
 
     private boolean isText() {
-        if (status == HttpStatus.OK) {
-            String type = headers.get(HttpUtils.CONTENT_TYPE);
+        if (status.getCode() == 200) {
+            String type = HttpUtils.getStringValue(headers, CONTENT_TYPE);
             if (type != null) {
                 type = type.toLowerCase();
                 // TODO may miss something
-                return type.contains("text") || type.contains("json");
+                return type.contains("text") || type.contains("json") || type.contains("xml");
             } else {
                 return false;
             }
-        } else {
+        } else {  // non 200: treat as text
             return true;
         }
     }
 
     private DynamicBytes unzipBody() throws IOException {
-        String encoding = headers.get(CONTENT_ENCODING);
+        String encoding = HttpUtils.getStringValue(headers, CONTENT_ENCODING);
         if (encoding == null || body.length() == 0) {
             return body;
         }
@@ -101,16 +99,18 @@ public class RespListener implements IRespListener {
     private final DynamicBytes body;
 
     // can be empty
-    private Map<String, String> headers = new TreeMap<String, String>();
+    private Map<String, Object> headers = new TreeMap<String, Object>();
     private HttpStatus status;
     private final IResponseHandler handler;
     private final IFilter filter;
     private final ExecutorService pool;
+    final int coercion;
 
-    public RespListener(IResponseHandler handler, IFilter filter, ExecutorService pool) {
-        body = new DynamicBytes(1024 * 16);
+    public RespListener(IResponseHandler handler, IFilter filter, ExecutorService pool, int coercion) {
+        body = new DynamicBytes(1024 * 8);
         this.filter = filter;
         this.handler = handler;
+        this.coercion = coercion;
         this.pool = pool;
     }
 
@@ -128,13 +128,18 @@ public class RespListener implements IRespListener {
         }
         try {
             DynamicBytes bytes = unzipBody();
-            if (isText()) {
+            // 1=> auto, 2=>text, 3=>stream, 4=>byte-array
+            if (coercion == 2 || (coercion == 1 && isText())) {
                 Charset charset = HttpUtils.detectCharset(headers, bytes);
                 String html = new String(bytes.get(), 0, bytes.length(), charset);
                 pool.submit(new Handler(handler, status.getCode(), headers, html));
             } else {
                 BytesInputStream is = new BytesInputStream(bytes.get(), bytes.length());
-                pool.submit(new Handler(handler, status.getCode(), headers, is));
+                if (coercion == 4) { // byte-array
+                    pool.submit(new Handler(handler, status.getCode(), headers, is.bytes()));
+                } else {
+                    pool.submit(new Handler(handler, status.getCode(), headers, is));
+                }
             }
         } catch (IOException e) {
             handler.onThrowable(e);
@@ -145,7 +150,7 @@ public class RespListener implements IRespListener {
         pool.submit(new Handler(handler, t));
     }
 
-    public void onHeadersReceived(Map<String, String> headers) throws AbortException {
+    public void onHeadersReceived(Map<String, Object> headers) throws AbortException {
         this.headers = headers;
         if (filter != null && !filter.accept(headers)) {
             throw new AbortException("Rejected when header received");

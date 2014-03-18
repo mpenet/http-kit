@@ -6,22 +6,30 @@
 ;;;; Ring server
 
 (defn run-server
-  "Starts (mostly*) Ring-compatible HTTP server and returns a nullary function
-  that stops the server.
+  "Starts (mostly*) Ring-compatible HTTP server and returns a function that stops
+  the server, which can take an optional timeout(ms)
+  param to wait existing requests to be finished, like (f :timeout 100).
 
   * See http://http-kit.org/migration.html for differences."
-  [handler {:keys [port thread ip max-body max-line worker-name-prefix queue-size]
+  [handler {:keys [port thread ip max-body max-line worker-name-prefix queue-size max-ws]
             :or   {ip "0.0.0.0"  ; which ip (if has many ips) to bind
                    port 8090     ; which port listen incomming request
                    thread 4      ; http worker thread count
                    queue-size 20480 ; max job queued before reject to project self
                    worker-name-prefix "worker-" ; woker thread name prefix
                    max-body 8388608             ; max http body: 8m
+                   max-ws  4194304              ; max websocket message size: 4m
                    max-line 4096}}]  ; max http inital line length: 4K
   (let [h (RingHandler. thread handler worker-name-prefix queue-size)
-        s (HttpServer. ip port h max-body max-line)]
+        s (HttpServer. ip port h max-body max-line max-ws)]
     (.start s)
-    (fn stop-server [] (.close h) (.stop s))))
+    (with-meta (fn stop-server [& {:keys [timeout] :or {timeout 100}}]
+                 ;; graceful shutdown:
+                 ;; 1. server stop accept new request
+                 ;; 2. wait for existing requests to finish
+                 ;; 3. close the server
+                 (.stop s timeout))
+      {:local-port (.getPort s)})))
 
 ;;;; Asynchronous extension
 
@@ -93,12 +101,16 @@
   ;; Asynchronous HTTP response (with optional streaming)
   (defn my-async-handler [request]
     (with-channel request ch ; Request's channel
-      (future ; Respond from any thread
-        (send! ch {:status  200
-                   :headers {\"Content-Type\" \"text/html\"}
-                   :body    \"This is an async response!\"}
-               ;; false ; Uncomment to use chunk encoding for HTTP streaming
-               ))))
+      ;; Make ch available to whoever can deliver the response to it; ex.:
+      (swap! clients conj ch)))   ; given (def clients (atom #{}))
+  ;; Some place later:
+  (doseq [ch @clients]
+    (swap! clients disj ch)
+    (send! ch {:status  200
+                 :headers {\"Content-Type\" \"text/html\"}
+                 :body your-async-response}
+             ;; false ; Uncomment to use chunk encoding for HTTP streaming
+             )))
 
   ;; WebSocket response
   (defn my-chatroom-handler [request]
@@ -120,12 +132,13 @@
 
   See org.httpkit.timer ns for optional timeout facilities."
   [request ch-name & body]
-  `(let [^AsyncChannel ~ch-name (:async-channel ~request)]
+  `(let [~ch-name (:async-channel ~request)]
      (if (:websocket? ~request)
        (if-let [key# (get-in ~request [:headers "sec-websocket-key"])]
-         (do (.sendHandshake ~ch-name {"Upgrade"    "websocket"
-                                       "Connection" "Upgrade"
-                                       "Sec-WebSocket-Accept" (accept key#)})
+         (do (.sendHandshake ~(with-meta ch-name {:tag `AsyncChannel})
+                             {"Upgrade"    "websocket"
+                              "Connection" "Upgrade"
+                              "Sec-WebSocket-Accept" (accept key#)})
              ~@body
              {:body ~ch-name})
          {:status 400 :body "Bad Sec-WebSocket-Key header"})

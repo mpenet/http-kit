@@ -9,7 +9,8 @@
             [org.httpkit.client :as client]
             [http.async.client :as h]
             [clj-http.util :as u])
-  (:import [org.httpkit.ws WebSocketClient]))
+  (:import [org.httpkit.ws WebSocketClient]
+           org.httpkit.SpecialHttpClient))
 
 (defn ws-handler [req]
   (with-channel req con
@@ -23,28 +24,23 @@
                           (println e)
                           (send! con msg)))))))
 
-(defn ws-handler2 [req]
+(defn ws-handler-sent-on-connect [req]
   (with-channel req con
     (send! con "hello") ;; should sendable when on-connet
     (send! con "world")
     (on-receive con (fn [mesg]
                       ;; only :body is picked
-                      (send! con {:body  mesg}))))) ; echo back
+                      (send! con {:body mesg}))))) ; echo back
 
-(defn ws-handler3 [req] ;; test with http.async.client
+(defn ws-handler-async-client [req] ;; test with http.async.client, echo back
   (with-channel req con
     (on-receive con (fn [mesg]
                       (send! con mesg)))))
 
-(defn ws-handler4 [req]
-  (with-channel req con
-    (on-receive con (fn [mesg]
-                      (send! con (pr-str {:message mesg}))))))
-
 (defn binary-ws-handler [req]
   (with-channel req con
     (on-receive con (fn [data]
-                      (let [retdata (doto (aclone data) (java.util.Arrays/sort))
+                      (let [retdata (doto (aclone ^bytes data) (java.util.Arrays/sort))
                             data (if (rand-nth [true false])
                                    (java.io.ByteArrayInputStream. retdata)
                                    retdata)]
@@ -59,12 +55,29 @@
                 (send! con (str (= id i)))))]
       (on-receive con h))))
 
+(defn not-interleave-handler [req]
+  (with-channel req con
+    (on-receive con
+                (fn [mesg]
+                  (let [total (to-int mesg)]
+                    (doall (pmap (fn [length idx]
+                                   (let [length (+ length 1025)
+                                         c (char (+ (int \0) (rem length 30)))]
+                                     ;; (Thread/sleep (rand-int (* 10 total)))
+                                     (send! con (apply str (concat (take 4 (concat
+                                                                            (str idx)
+                                                                            (repeat \0)))
+                                                                   (repeat length c))))))
+                                 (repeatedly total (partial rand-int (* 1024 1024)))
+                                 (range 10 1000))))))))
+
 (defroutes test-routes
   (GET "/ws" [] ws-handler)
-  (GET "/ws2" [] ws-handler2)
-  (GET "/ws3" [] ws-handler3)
-  (GET "/ws4" [] ws-handler4)
+  (GET "/sent-on-connect" [] ws-handler-sent-on-connect)
+  (GET "/echo" [] ws-handler-async-client)
+  (GET "/http-async-client" [] ws-handler-async-client)
   (GET "/binary" [] binary-ws-handler)
+  (GET "/interleaved" [] not-interleave-handler)
   (GET "/order" [] messg-order-handler))
 
 (use-fixtures :once (fn [f]
@@ -105,26 +118,34 @@
                             "\nreceive:\n" r))
               (is false))))
         (let [d (subs const-string 0 120)]
-          (= d (.ping client d)))))
+          (= d (.ping client d))
+          (= d (.pong client d)))))
     (.close client)))
 
 (deftest test-sent-message-in-body      ; issue #14
-  (let [client (WebSocketClient. "ws://localhost:4348/ws2")]
+  (let [client (WebSocketClient. "ws://localhost:4348/sent-on-connect")]
     (is (= "hello" (.getMessage client)))
     (is (= "world" (.getMessage client)))
-    (doseq [idx (range 0 5)]
+    (doseq [idx (range 0 3)]
       (let [mesg (str "message#" idx)]
         (.sendMessage client mesg)
         (is (= mesg (.getMessage client))))) ;; echo expected
     (.close client)))
 
-(deftest test-on-send-properly-applyed      ; issue #14
-  (let [client (WebSocketClient. "ws://localhost:4348/ws4")]
-    (doseq [idx (range 0 5)]
-      (let [mesg (str "message#" idx)]
-        (.sendMessage client mesg)
-        (is (= mesg (:message (read-string (.getMessage client)))))))
-    (.close client)))
+(deftest test-tcp-segmented-frame-does-right  ; issue #47
+  (let [data (slurp "test/ws_unmask_bug_47.txt") ; 65 data, segement sure, since receive buffer is 64K
+        data_3 (str data data data)
+        client (WebSocketClient. "ws://localhost:4348/echo")]
+    (dotimes [_ 3]
+      (.sendFragmentedMesg client data_3 3)
+      (is (= data_3 (.getMessage client)))
+      (.sendMessage client data)
+      (is (= data (.getMessage client))))))
+
+;; client can sent a byte a time
+;; https://github.com/http-kit/http-kit/issues/80
+(deftest test-slow-client
+  (is (SpecialHttpClient/slowWebSocketClient "ws://localhost:4348/echo")))
 
 (deftest test-binary-frame
   (let [client (WebSocketClient. "ws://localhost:4348/binary")]
@@ -154,11 +175,31 @@
         (is (= "true" (.getMessage client))))
       (.close client))))
 
+(deftest test-message-are-not-interleaved
+  ;; TODO when length is large, http-kit seem to drop some buffer.
+  ;; The problem remains even if writen is done by a signle Thread
+  ;; A bug of http-kit or JVM?
+  ;; Not a issue for http, But maybe a issue for websocket:
+  ;; If write many large chunks of messages to client using many threads concurrenly
+  (let [client (WebSocketClient. "ws://localhost:4348/interleaved")
+        length 10]
+    (.sendMessage client (str length))
+    (doseq [i (range 0 length)]
+      (let [mesg ^String (.getMessage client)]
+        (if mesg
+          (let [idx (.substring mesg 0 4)
+                mesg (.substring mesg 4)
+                ch (first mesg)]
+            (is (every? (fn [c] (= c ch)) mesg)))
+          ;; fail
+          (is (> (count mesg) 1024)))))
+    (.close client)))
+
 (deftest test-with-http.async.client
   (with-open [client (h/create-client)]
     (let [latch (promise)
           received-msg (atom nil)
-          ws (h/websocket client "ws://localhost:4348/ws3"
+          ws (h/websocket client "ws://localhost:4348/http-async-client"
                           :text (fn [con mesg]
                                   (reset! received-msg mesg)
                                   (deliver latch true))

@@ -1,5 +1,9 @@
 package org.httpkit.client;
 
+import org.httpkit.HttpMethod;
+import org.junit.Before;
+import org.junit.Test;
+
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
@@ -8,31 +12,27 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import org.httpkit.HttpMethod;
-import org.junit.Before;
-import org.junit.Test;
-
 public class TextClientTest {
     HttpClient client;
 
     @Before
     public void setup() throws IOException {
-        client = new HttpClient(new HttpClientConfig(40000, "user-agent", 40000));
+        client = new HttpClient();
     }
 
     @Test
     public void testAbort() throws UnknownHostException, URISyntaxException,
             InterruptedException {
-        String[] urls = new String[] { "http://cdn-smooth.ms-studiosmedia.com/news/mp4_mq/06182012_Surface_750k.mp4", };
+        String[] urls = new String[]{"http://cdn-smooth.ms-studiosmedia.com/news/mp4_mq/06182012_Surface_750k.mp4",};
         runIt(urls);
     }
 
     @Test
     public void testDecode() throws IOException, URISyntaxException, InterruptedException {
-        String[] urls = new String[] { "http://feed.feedsky.com/amaze",
+        String[] urls = new String[]{"http://feed.feedsky.com/amaze",
                 "http://macorz.cn/feed", "http://www.ourlinux.net/feed",
                 "http://blog.jjgod.org/feed/", "http://www.lostleon.com/blog/feed/",
-                "http://feed.feedsky.com/hellodb" };
+                "http://feed.feedsky.com/hellodb"};
 
         // urls = new String[] {
         // "http://finance.sina.com.cn/stock/jsy/20120709/183612517402.shtml" };
@@ -56,12 +56,12 @@ public class TextClientTest {
                     t.printStackTrace();
                 }
 
-                public void onSuccess(int status, Map<String, String> headers, Object body) {
+                public void onSuccess(int status, Map<String, Object> headers, Object body) {
                     System.out.println(body);
                 }
             };
-            client.exec(url, HttpMethod.GET, null, null, -1, new RespListener(handler,
-                    IFilter.ACCEPT_ALL, pool));
+            client.exec(url, new RequestConfig(), null, new RespListener(handler,
+                    IFilter.ACCEPT_ALL, pool, 1));
         }
 
         latch.await();

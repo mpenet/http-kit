@@ -1,17 +1,17 @@
 package org.httpkit.server;
 
-import static org.httpkit.HttpUtils.*;
-import static org.httpkit.HttpVersion.HTTP_1_0;
-import static org.httpkit.HttpVersion.HTTP_1_1;
+import org.httpkit.*;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.TreeMap;
 
-import org.httpkit.*;
+import static org.httpkit.HttpUtils.*;
+import static org.httpkit.HttpVersion.HTTP_1_0;
+import static org.httpkit.HttpVersion.HTTP_1_1;
 
-public class RequestDecoder {
+public class HttpDecoder {
 
     public enum State {
         ALL_READ, READ_INITIAL, READ_HEADER, READ_FIXED_LENGTH_CONTENT, READ_CHUNK_SIZE, READ_CHUNKED_CONTENT, READ_CHUNK_FOOTER, READ_CHUNK_DELIMITER,
@@ -22,19 +22,15 @@ public class RequestDecoder {
     private int readCount = 0; // already read bytes count
 
     HttpRequest request; // package visible
-    private Map<String, String> headers = new TreeMap<String, String>();
+    private Map<String, Object> headers = new TreeMap<String, Object>();
     byte[] content;
 
-    int lineBufferIdx = 0;
-    // 1k buffer, increase as necessary;
-    private byte[] lineBuffer = new byte[1024];
-
     private final int maxBody;
-    private final int maxLine;
+    private final LineReader lineReader;
 
-    public RequestDecoder(int maxBody, int maxLine) {
+    public HttpDecoder(int maxBody, int maxLine) {
         this.maxBody = maxBody;
-        this.maxLine = maxLine;
+        this.lineReader = new LineReader(maxLine);
     }
 
     private void createRequest(String sb) throws ProtocolException {
@@ -52,12 +48,11 @@ public class RequestDecoder {
         bEnd = findWhitespace(sb, bStart);
 
         cStart = findNonWhitespace(sb, bEnd);
-        cEnd = findEndOfString(sb);
+        cEnd = findEndOfString(sb, cStart);
 
         if (cStart < cEnd) {
             try {
-                HttpMethod method = HttpMethod
-                        .valueOf(sb.substring(aStart, aEnd).toUpperCase());
+                HttpMethod method = HttpMethod.valueOf(sb.substring(aStart, aEnd).toUpperCase());
                 HttpVersion version = HTTP_1_1;
                 if ("HTTP/1.0".equals(sb.substring(cStart, cEnd))) {
                     version = HTTP_1_0;
@@ -76,57 +71,57 @@ public class RequestDecoder {
         String line;
         while (buffer.hasRemaining()) {
             switch (state) {
-            case ALL_READ:
-                return request;
-            case READ_INITIAL:
-                line = readLine(buffer);
-                if (line != null) {
-                    createRequest(line);
-                    state = State.READ_HEADER;
-                }
-                break;
-            case READ_HEADER:
-                readHeaders(buffer);
-                break;
-            case READ_CHUNK_SIZE:
-                line = readLine(buffer);
-                if (line != null) {
-                    readRemaining = getChunkSize(line);
-                    if (readRemaining == 0) {
-                        state = State.READ_CHUNK_FOOTER;
-                    } else {
-                        throwIfBodyIsTooLarge();
-                        if (content == null) {
-                            content = new byte[readRemaining];
-                        } else if (content.length < readCount + readRemaining) {
-                            // *1.3 to protect slow client
-                            int newLength = (int) ((readRemaining + readCount) * 1.3);
-                            content = Arrays.copyOf(content, newLength);
-                        }
-                        state = State.READ_CHUNKED_CONTENT;
+                case ALL_READ:
+                    return request;
+                case READ_INITIAL:
+                    line = lineReader.readLine(buffer);
+                    if (line != null) {
+                        createRequest(line);
+                        state = State.READ_HEADER;
                     }
-                }
-                break;
-            case READ_FIXED_LENGTH_CONTENT:
-                readFixedLength(buffer);
-                if (readRemaining == 0) {
+                    break;
+                case READ_HEADER:
+                    readHeaders(buffer);
+                    break;
+                case READ_CHUNK_SIZE:
+                    line = lineReader.readLine(buffer);
+                    if (line != null) {
+                        readRemaining = getChunkSize(line);
+                        if (readRemaining == 0) {
+                            state = State.READ_CHUNK_FOOTER;
+                        } else {
+                            throwIfBodyIsTooLarge();
+                            if (content == null) {
+                                content = new byte[readRemaining];
+                            } else if (content.length < readCount + readRemaining) {
+                                // *1.3 to protect slow client
+                                int newLength = (int) ((readRemaining + readCount) * 1.3);
+                                content = Arrays.copyOf(content, newLength);
+                            }
+                            state = State.READ_CHUNKED_CONTENT;
+                        }
+                    }
+                    break;
+                case READ_FIXED_LENGTH_CONTENT:
+                    readFixedLength(buffer);
+                    if (readRemaining == 0) {
+                        finish();
+                    }
+                    break;
+                case READ_CHUNKED_CONTENT:
+                    readFixedLength(buffer);
+                    if (readRemaining == 0) {
+                        state = State.READ_CHUNK_DELIMITER;
+                    }
+                    break;
+                case READ_CHUNK_FOOTER:
+                    readEmptyLine(buffer);
                     finish();
-                }
-                break;
-            case READ_CHUNKED_CONTENT:
-                readFixedLength(buffer);
-                if (readRemaining == 0) {
-                    state = State.READ_CHUNK_DELIMITER;
-                }
-                break;
-            case READ_CHUNK_FOOTER:
-                readEmptyLine(buffer);
-                finish();
-                break;
-            case READ_CHUNK_DELIMITER:
-                readEmptyLine(buffer);
-                state = State.READ_CHUNK_SIZE;
-                break;
+                    break;
+                case READ_CHUNK_DELIMITER:
+                    readEmptyLine(buffer);
+                    state = State.READ_CHUNK_SIZE;
+                    break;
             }
         }
         return state == State.ALL_READ ? request : null;
@@ -153,10 +148,10 @@ public class RequestDecoder {
 
     private void readHeaders(ByteBuffer buffer) throws LineTooLargeException,
             RequestTooLargeException, ProtocolException {
-        String line = readLine(buffer);
+        String line = lineReader.readLine(buffer);
         while (line != null && !line.isEmpty()) {
             HttpUtils.splitAndAddHeader(line, headers);
-            line = readLine(buffer);
+            line = lineReader.readLine(buffer);
         }
 
         if (line == null) {
@@ -165,11 +160,11 @@ public class RequestDecoder {
 
         request.setHeaders(headers);
 
-        String te = headers.get(TRANSFER_ENCODING);
+        String te = HttpUtils.getStringValue(headers, TRANSFER_ENCODING);
         if (CHUNKED.equals(te)) {
             state = State.READ_CHUNK_SIZE;
         } else {
-            String cl = headers.get(CONTENT_LENGTH);
+            String cl = HttpUtils.getStringValue(headers, CONTENT_LENGTH);
             if (cl != null) {
                 try {
                     readRemaining = Integer.parseInt(cl);
@@ -189,42 +184,12 @@ public class RequestDecoder {
         }
     }
 
-    String readLine(ByteBuffer buffer) throws LineTooLargeException {
-        byte b;
-        boolean more = true;
-        while (buffer.hasRemaining() && more) {
-            b = buffer.get();
-            if (b == CR) {
-                if (buffer.hasRemaining() && buffer.get() == LF) {
-                    more = false;
-                }
-            } else if (b == LF) {
-                more = false;
-            } else {
-                if (lineBufferIdx == maxLine - 2) {
-                    throw new LineTooLargeException("line length exceed " + lineBuffer.length);
-                }
-                if (lineBufferIdx == lineBuffer.length) {
-                    lineBuffer = Arrays.copyOf(lineBuffer, lineBuffer.length * 2);
-                }
-                lineBuffer[lineBufferIdx] = b;
-                ++lineBufferIdx;
-            }
-        }
-        String line = null;
-        if (!more) {
-            line = new String(lineBuffer, 0, lineBufferIdx);
-            lineBufferIdx = 0;
-        }
-        return line;
-    }
-
     public void reset() {
         state = State.READ_INITIAL;
-        headers = new TreeMap<String, String>();
+        headers = new TreeMap<String, Object>();
         readCount = 0;
         content = null;
-        lineBufferIdx = 0;
+        lineReader.reset();
         request = null;
     }
 

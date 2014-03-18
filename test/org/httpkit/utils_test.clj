@@ -3,6 +3,7 @@
   (:require [clojure.java.io :as io])
   (:import org.httpkit.HttpUtils
            org.httpkit.DynamicBytes
+           org.httpkit.HeaderMap
            java.net.URI
            java.nio.charset.Charset))
 
@@ -47,9 +48,18 @@
 
 (deftest testencodeURI
   (is (= "%E6%B2%88%E9%94%8B0" (HttpUtils/encodeURI "沈锋0")))
-  (is (= "%20!%22#$%25&'()*+,-./0123456789:;%3C=%3E?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[%5C]%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~"
+  (is (= "%20!%22#$%&'()*+,-./0123456789:;%3C=%3E?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[%5C]%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~"
          (HttpUtils/encodeURI " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"))))
 
 (deftest test-get-host
   (is (= "shenfeng.me" (HttpUtils/getHost (URI. "http://shenfeng.me/what"))))
   (is (= "shenfeng.me:7979" (HttpUtils/getHost (URI. "http://shenfeng.me:7979/what")))))
+
+(deftest test-headermap
+  (let [m ^HeaderMap (HeaderMap.)]
+    (doseq [i (range 1 70)]
+      (.put m (str "key-" i) (str "value-" i))
+      (doseq [j (range 1 i)]
+        (is (= (str "value-" j) (.get m (str "key-" j))))
+        (is (.containsKey m (str "key-" j))))
+      (is (not (.containsKey m (str "key-" (inc i))))))))

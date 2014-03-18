@@ -1,15 +1,13 @@
 package org.httpkit.server;
 
-import static org.httpkit.HttpUtils.CHARSET;
-import static org.httpkit.HttpUtils.CONNECTION;
-import static org.httpkit.HttpUtils.CONTENT_TYPE;
-import static org.httpkit.HttpVersion.HTTP_1_1;
+import org.httpkit.*;
 
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.util.Map;
 
-import org.httpkit.*;
+import static org.httpkit.HttpUtils.*;
+import static org.httpkit.HttpVersion.HTTP_1_1;
 
 public class HttpRequest {
     public final String queryString;
@@ -22,15 +20,15 @@ public class HttpRequest {
     // package visible
     int serverPort = 80;
     String serverName;
-    Map<String, String> headers;
+    Map<String, Object> headers;
     int contentLength = 0;
     String contentType;
     String charset = "utf8";
     boolean isKeepAlive = false;
     boolean isWebSocket = false;
-    
+
     InetSocketAddress remoteAddr;
-    AsyncChannel asycChannel;
+    AsyncChannel channel;
 
     public HttpRequest(HttpMethod method, String url, HttpVersion version) {
         this.method = method;
@@ -53,7 +51,7 @@ public class HttpRequest {
     }
 
     public String getRemoteAddr() {
-        String h = headers.get(HttpUtils.X_FORWARDED_FOR);
+        String h = getStringValue(headers, HttpUtils.X_FORWARDED_FOR);
         if (null != h) {
             int idx = h.indexOf(',');
             if (idx == -1) {
@@ -72,10 +70,10 @@ public class HttpRequest {
         this.contentLength = count;
     }
 
-    public void setHeaders(Map<String, String> headers) {
-        String h = headers.get("host");
+    public void setHeaders(Map<String, Object> headers) {
+        String h = getStringValue(headers, "host");
         if (h != null) {
-            int idx = h.indexOf(':');
+            int idx = h.lastIndexOf(':');
             if (idx != -1) {
                 this.serverName = h.substring(0, idx);
                 serverPort = Integer.valueOf(h.substring(idx + 1));
@@ -84,7 +82,7 @@ public class HttpRequest {
             }
         }
 
-        String ct = headers.get(CONTENT_TYPE);
+        String ct = getStringValue(headers, CONTENT_TYPE);
         if (ct != null) {
             int idx = ct.indexOf(";");
             if (idx != -1) {
@@ -100,13 +98,13 @@ public class HttpRequest {
             }
         }
 
-        String con = headers.get(CONNECTION);
+        String con = getStringValue(headers, CONNECTION);
         if (con != null) {
             con = con.toLowerCase();
         }
 
         isKeepAlive = (version == HTTP_1_1 && !"close".equals(con)) || "keep-alive".equals(con);
-        isWebSocket = "websocket".equalsIgnoreCase(headers.get("upgrade"));
+        isWebSocket = "websocket".equalsIgnoreCase(getStringValue(headers, "upgrade"));
         this.headers = headers;
     }
 }

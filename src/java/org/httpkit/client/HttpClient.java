@@ -1,45 +1,58 @@
 package org.httpkit.client;
 
-import static java.lang.System.currentTimeMillis;
-import static java.nio.channels.SelectionKey.OP_CONNECT;
-import static java.nio.channels.SelectionKey.OP_READ;
-import static java.nio.channels.SelectionKey.OP_WRITE;
-import static org.httpkit.HttpUtils.BUFFER_SIZE;
-import static org.httpkit.HttpUtils.SP;
-import static org.httpkit.HttpUtils.getServerAddr;
-import static org.httpkit.client.State.ALL_READ;
-import static org.httpkit.client.State.READ_INITIAL;
+import org.httpkit.*;
+import org.httpkit.ProtocolException;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
-import java.util.*;
+import java.security.NoSuchAlgorithmException;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.httpkit.*;
-import org.httpkit.PriorityQueue;
-import org.httpkit.ProtocolException;
+import static java.lang.System.currentTimeMillis;
+import static java.nio.channels.SelectionKey.*;
+import static org.httpkit.HttpUtils.SP;
+import static org.httpkit.HttpUtils.getServerAddr;
+import static org.httpkit.client.State.ALL_READ;
+import static org.httpkit.client.State.READ_INITIAL;
 
 public final class HttpClient implements Runnable {
     private static final AtomicInteger ID = new AtomicInteger(0);
 
+    public static final SSLContext DEFAULT_CONTEXT;
+
+    static {
+        try {
+            DEFAULT_CONTEXT = SSLContext.getDefault();
+        } catch (NoSuchAlgorithmException e) {
+            throw new Error("Failed to initialize SSLContext", e);
+        }
+    }
+
+    // queue request, for only issue connection in the IO thread
     private final Queue<Request> pending = new ConcurrentLinkedQueue<Request>();
+    // ongoing requests, saved for timeout check
     private final PriorityQueue<Request> requests = new PriorityQueue<Request>();
+    // reuse TCP connection
     private final PriorityQueue<PersistentConn> keepalives = new PriorityQueue<PersistentConn>();
 
     private volatile boolean running = true;
 
-    private final HttpClientConfig config;
     // shared, single thread
-    private final ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+    private final ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 64);
     private final Selector selector;
 
-    public HttpClient(HttpClientConfig config) throws IOException {
-        this.config = config;
+    public HttpClient() throws IOException {
         int id = ID.incrementAndGet();
         String name = "client-loop";
         if (id > 1) {
@@ -60,7 +73,7 @@ public final class HttpClient implements Runnable {
                     msg = "read timeout: ";
                 }
                 // will remove it from queue
-                r.finish(new TimeoutException(msg + r.timeOutMs + "ms"));
+                r.finish(new TimeoutException(msg + r.cfg.timeout + "ms"));
                 if (r.key != null) {
                     closeQuietly(r.key);
                 }
@@ -81,12 +94,12 @@ public final class HttpClient implements Runnable {
     }
 
     /**
-     * tricky part
-     * 
      * http-kit think all connections are keep-alived (since some say it is, but
-     * actually is not). but, some are not, http-kit pick them out **after the
-     * fact** 1. the connection is resued 2. no data received
-     * 
+     * actually is not). but, some are not, http-kit pick them out after the fact
+     * <ol>
+     * <li>The connection is reused</li>
+     * <li>No data received</li>
+     * </ol>
      */
     private boolean cleanAndRetryIfBroken(SelectionKey key, Request req) {
         closeQuietly(key);
@@ -100,8 +113,7 @@ public final class HttpClient implements Runnable {
             requests.remove(req); // remove from timeout queue
             pending.offer(req); // queue for retry
             selector.wakeup();
-            // retry (re-open a connection to server, sent the request again)
-            return true;
+            return true; // retry: re-open a connection to server, sent the request again
         }
         return false;
     }
@@ -109,15 +121,28 @@ public final class HttpClient implements Runnable {
     private void doRead(SelectionKey key, long now) {
         Request req = (Request) key.attachment();
         SocketChannel ch = (SocketChannel) key.channel();
-        buffer.clear();
         int read = 0;
         try {
-            read = ch.read(buffer);
+            buffer.clear();
+            if (req instanceof HttpsRequest) {
+                HttpsRequest httpsReq = (HttpsRequest) req;
+                if (httpsReq.handshaken) {
+                    // SSLEngine closed => fine, will return -1 in the next run
+                    read = httpsReq.unwrapRead(buffer);
+                } else {
+                    read = httpsReq.doHandshake(buffer);
+                }
+            } else {
+                read = ch.read(buffer);
+            }
         } catch (IOException e) { // The remote forcibly closed the connection
             if (!cleanAndRetryIfBroken(key, req)) {
-                // os X get Connection reset by peer error,
-                req.finish(e);
+                req.finish(e); // os X get Connection reset by peer error,
             }
+            // java.security.InvalidAlgorithmParameterException: Prime size must be multiple of 64, and can only range from 512 to 1024 (inclusive)
+            // java.lang.RuntimeException: Could not generate DH keypair
+        } catch (Exception e) {
+            req.finish(e);
         }
 
         if (read == -1) { // read all, remote closed it cleanly
@@ -130,8 +155,11 @@ public final class HttpClient implements Runnable {
             try {
                 if (req.decoder.decode(buffer) == ALL_READ) {
                     req.finish();
-                    // TODO keepalive configurable per request: disable by <=0
-                    keepalives.offer(new PersistentConn(now + config.keepalive, req.addr, key));
+                    if (req.cfg.keepAlive > 0) {
+                        keepalives.offer(new PersistentConn(now + req.cfg.keepAlive, req.addr, key));
+                    } else {
+                        closeQuietly(key);
+                    }
                 }
             } catch (HTTPException e) {
                 closeQuietly(key);
@@ -139,13 +167,14 @@ public final class HttpClient implements Runnable {
             } catch (Exception e) {
                 closeQuietly(key);
                 req.finish(e);
-                HttpUtils.printError("Should not happen!!", e); // decoding
+                HttpUtils.printError("should not happen", e); // decoding
             }
         }
     }
 
     private void closeQuietly(SelectionKey key) {
         try {
+            // TODO engine.closeInbound
             key.channel().close();
         } catch (Exception ignore) {
         }
@@ -155,20 +184,34 @@ public final class HttpClient implements Runnable {
         Request req = (Request) key.attachment();
         SocketChannel ch = (SocketChannel) key.channel();
         try {
-            ByteBuffer[] request = req.request;
-            ch.write(request);
-            if (!request[request.length - 1].hasRemaining()) {
-                key.interestOps(OP_READ);
+            if (req instanceof HttpsRequest) {
+                HttpsRequest httpsReq = (HttpsRequest) req;
+                if (httpsReq.handshaken) {
+                    // will flip to OP_READ
+                    httpsReq.writeWrappedRequest();
+                } else {
+                    buffer.clear();
+                    if (httpsReq.doHandshake(buffer) < 0) {
+                        req.finish(); // will be a No status exception
+                    }
+                }
+            } else {
+                ByteBuffer[] buffers = req.request;
+                ch.write(buffers);
+                if (!buffers[buffers.length - 1].hasRemaining()) {
+                    key.interestOps(OP_READ);
+                }
             }
         } catch (IOException e) {
             if (!cleanAndRetryIfBroken(key, req)) {
                 req.finish(e);
             }
+        } catch (Exception e) { // rarely happen
+            req.finish(e);
         }
     }
 
-    public void exec(String url, HttpMethod method, Map<String, Object> headers, Object body,
-            int timeoutMs, IRespListener cb) {
+    public void exec(String url, RequestConfig cfg, SSLEngine engine, IRespListener cb) {
         URI uri;
         try {
             uri = new URI(url);
@@ -176,8 +219,16 @@ public final class HttpClient implements Runnable {
             cb.onThrowable(e);
             return;
         }
-        if (!"http".equals(uri.getScheme())) {
-            cb.onThrowable(new ProtocolException(uri.getScheme() + " is not supported"));
+
+        if (uri.getHost() == null) {
+            cb.onThrowable(new IllegalArgumentException("host is null: " + url));
+            return;
+        }
+
+        String scheme = uri.getScheme();
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            String message = (scheme == null) ? "No protocol specified" : scheme + " is not supported";
+            cb.onThrowable(new ProtocolException(message));
             return;
         }
 
@@ -190,32 +241,39 @@ public final class HttpClient implements Runnable {
         }
 
         // copy to modify, normalize header
-        headers = HttpUtils.camelCase(headers);
+        HeaderMap headers = HeaderMap.camelCase(cfg.headers);
         headers.put("Host", HttpUtils.getHost(uri));
-        headers.put("Accept", "*/*");
 
+        if (!headers.containsKey("Accept")) // allow override
+            headers.put("Accept", "*/*");
         if (!headers.containsKey("User-Agent")) // allow override
-            headers.put("User-Agent", config.userAgent); // default
+            headers.put("User-Agent", RequestConfig.DEFAULT_USER_AGENT); // default
         if (!headers.containsKey("Accept-Encoding"))
-            headers.put("Accept-Encoding", "gzip, deflate");
+            headers.put("Accept-Encoding", "gzip, deflate"); // compression is good
 
         ByteBuffer request[];
         try {
-            request = encode(method, headers, body, uri);
+            request = encode(cfg.method, headers, cfg.body, uri);
         } catch (IOException e) {
             cb.onThrowable(e);
             return;
         }
-        if (timeoutMs == -1) {
-            timeoutMs = config.timeOutMs;
+        if ("https".equals(scheme)) {
+            if (engine == null) {
+                engine = DEFAULT_CONTEXT.createSSLEngine();
+            }
+            engine.setUseClientMode(true);
+            pending.offer(new HttpsRequest(addr, request, cb, requests, cfg, engine));
+        } else {
+            pending.offer(new Request(addr, request, cb, requests, cfg));
         }
 
-        pending.offer(new Request(addr, request, cb, requests, timeoutMs, method));
+//        pending.offer(new Request(addr, request, cb, requests, cfg));
         selector.wakeup();
     }
 
-    private ByteBuffer[] encode(HttpMethod method, Map<String, Object> headers, Object body,
-            URI uri) throws IOException {
+    private ByteBuffer[] encode(HttpMethod method, HeaderMap headers, Object body,
+                                URI uri) throws IOException {
         ByteBuffer bodyBuffer = HttpUtils.bodyBuffer(body);
 
         if (body != null) {
@@ -226,13 +284,13 @@ public final class HttpClient implements Runnable {
         DynamicBytes bytes = new DynamicBytes(196);
         bytes.append(method.toString()).append(SP).append(HttpUtils.getPath(uri));
         bytes.append(" HTTP/1.1\r\n");
-        HttpUtils.encodeHeaders(bytes, headers);
+        headers.encodeHeaders(bytes);
         ByteBuffer headBuffer = ByteBuffer.wrap(bytes.get(), 0, bytes.length());
 
         if (bodyBuffer == null) {
-            return new ByteBuffer[] { headBuffer };
+            return new ByteBuffer[]{headBuffer};
         } else {
-            return new ByteBuffer[] { headBuffer, bodyBuffer };
+            return new ByteBuffer[]{headBuffer, bodyBuffer};
         }
     }
 
@@ -244,6 +302,9 @@ public final class HttpClient implements Runnable {
                 req.isConnected = true;
                 req.onProgress(now);
                 key.interestOps(OP_WRITE);
+                if (req instanceof HttpsRequest) {
+                    ((HttpsRequest) req).engine.beginHandshake();
+                }
             }
         } catch (IOException e) {
             closeQuietly(key); // not added to kee-alive yet;
@@ -254,30 +315,41 @@ public final class HttpClient implements Runnable {
     private void processPending() {
         Request job = null;
         while ((job = pending.poll()) != null) {
-            PersistentConn con = keepalives.remove(job.addr);
-            if (con != null) { // keep alive
-                SelectionKey key = con.key;
-                if (key.isValid()) {
-                    job.isReuseConn = true;
-                    key.attach(job);
-                    key.interestOps(OP_WRITE);
-                    requests.offer(job);
-                    continue;
-                } else {
-                    // this should not happen often
-                    closeQuietly(key);
+            if (job.cfg.keepAlive > 0) {
+                PersistentConn con = keepalives.remove(job.addr);
+                if (con != null) { // keep alive
+                    SelectionKey key = con.key;
+                    if (key.isValid()) {
+                        job.isReuseConn = true;
+                        // reuse key, engine
+                        try {
+                            job.recycle((Request) key.attachment());
+                            key.attach(job);
+                            key.interestOps(OP_WRITE);
+                            requests.offer(job);
+                            continue;
+                        } catch (SSLException e) {
+                            closeQuietly(key); // https wrap SSLException, start from fresh
+                        }
+                    } else {
+                        // this should not happen often
+                        closeQuietly(key);
+                    }
                 }
             }
             try {
                 SocketChannel ch = SocketChannel.open();
                 ch.configureBlocking(false);
-                // saved for timeout
-                job.key = ch.register(selector, OP_CONNECT, job);
-                ch.connect(job.addr);
+                boolean connected = ch.connect(job.addr);
+                job.isConnected = connected;
+
+                // if connection is established immediatelly, should wait for write. Fix #98
+                job.key = ch.register(selector, connected ? OP_WRITE : OP_CONNECT, job);
+                // save key for timeout check
                 requests.offer(job);
             } catch (IOException e) {
                 job.finish(e);
-                HttpUtils.printError("Try to connect " + job.addr, e);
+                // HttpUtils.printError("Try to connect " + job.addr, e);
             }
         }
     }
@@ -307,8 +379,8 @@ public final class HttpClient implements Runnable {
                 }
                 clearTimeout(now);
                 processPending();
-            } catch (IOException e) {
-                HttpUtils.printError("select exception", e);
+            } catch (Throwable e) { // catch any exception (including OOM), print it: do not exits the loop
+                HttpUtils.printError("select exception, should not happen", e);
             }
         }
     }
@@ -322,6 +394,6 @@ public final class HttpClient implements Runnable {
 
     @Override
     public String toString() {
-        return this.getClass().getCanonicalName() + config.toString();
+        return this.getClass().getCanonicalName();
     }
 }

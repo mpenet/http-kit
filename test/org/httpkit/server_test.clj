@@ -3,11 +3,13 @@
         ring.middleware.file-info
         org.httpkit.test-util
         [clojure.java.io :only [input-stream]]
-        (compojure [core :only [defroutes GET POST HEAD DELETE ANY]]
+        [ring.adapter.jetty :only [run-jetty]]
+        (compojure [core :only [defroutes GET POST HEAD DELETE ANY context]]
                    [handler :only [site]])
         org.httpkit.server
         org.httpkit.timer)
   (:require [clj-http.client :as http]
+            [org.httpkit.ws-test :as ws]
             [org.httpkit.client :as client]
             [clj-http.util :as u])
   (:import [java.io File FileOutputStream FileInputStream]
@@ -23,6 +25,15 @@
         file (gen-tempfile l ".txt")]
     {:status 200
      :body (FileInputStream. file)}))
+
+(defn many-headers-handler [req]
+  (let [count (or (-> req :params :count to-int) 20)]
+    {:status 200
+     :headers (assoc
+                  (into {} (map (fn [idx]
+                                  [(str "key-" idx) (str "value-" idx)])
+                                (range 0 (inc count))))
+                "x-header-1" ["abc" "def"])}))
 
 (defn multipart-handler [req]
   (let [{:keys [title file]} (:params req)]
@@ -92,21 +103,26 @@
 (defroutes test-routes
   (GET "/" [] "hello world")
   (GET "/timeout" [] async-with-timeout)
+  (GET "/headers" [] many-headers-handler)
   (ANY "/spec" [] (fn [req] (pr-str (dissoc req :body :async-channel))))
   (GET "/string" [] (fn [req] {:status 200
-                              :headers {"Content-Type" "text/plain"}
-                              :body "Hello World"}))
+                               :headers {"Content-Type" "text/plain"}
+                               :body "Hello World"}))
   (GET "/iseq" [] (fn [req] {:status 200
-                            :headers {"Content-Type" "text/plain"}
-                            :body (range 1 10)}))
+                             :headers {"Content-Type" "text/plain"}
+                             :body (range 1 10)}))
   (GET "/file" [] (wrap-file-info file-handler))
   (GET "/ws" [] (fn [req]
                   (with-channel req con
                     (on-receive con (fn [mesg] (send! con mesg))))))
+  (context "/ws2" [] ws/test-routes)
   (GET "/inputstream" [] inputstream-handler)
   (POST "/multipart" [] multipart-handler)
   (POST "/chunked-input" [] (fn [req] {:status 200
-                                      :body (str (:content-length req))}))
+                                       :body (str (:content-length req))}))
+  (GET "/length" [] (fn [req]
+                      (let [l (-> req :params :length to-int)]
+                        (subs const-string 0 l))))
   (GET "/null" [] (fn [req] {:status 200 :body nil}))
   (GET "/demo" [] streaming-demo)
 
@@ -158,8 +174,14 @@
     (is (= (get-in resp [:headers "content-type"]) "text/plain"))
     (is (= (:body resp) "Hello World"))))
 
+(deftest test-many-headers
+  (doseq [c (range 5 40)]
+    (let [resp (http/get (str "http://localhost:4347/headers?count=" c))]
+      (is (= (:status resp) 200))
+      (is (= (get-in resp [:headers (str "key-" c)]) (str "value-" c))))))
+
 (deftest test-body-file
-  (doseq [length (range 1 (* 1024 1024 5) 1439987)]
+  (doseq [length (range 1 (* 1024 1024 8) 1439987)]
     (let [resp (http/get "http://localhost:4347/file?l=" length)]
       (is (= (:status resp) 200))
       (is (= (get-in resp [:headers "content-type"]) "text/plain"))
@@ -222,6 +244,14 @@
       (is (= (:status resp) 200))
       (is (:headers resp))
       (is (= (:body resp) s))
+      (check-on-close-called)))
+  (doseq [_ (range 1 2)]
+    (let [s (subs const-string 0 (+ (rand-int 1024) 256))
+          resp @(client/get (str "http://localhost:4347/streaming?s=" s)
+                            {:headers {"Connection" "close"}})]
+      (is (= (:status resp) 200))
+      (is (:headers resp))
+      (is (= (:body resp) s))
       (check-on-close-called))))
 
 (deftest test-client-abort-server-receive-on-close
@@ -263,6 +293,16 @@
     (= 2 (count (re-seq #"hello world" resp)))
     (= 2 (count (re-seq #"200" resp)))))
 
+(deftest test-http10-keepalive
+  ;; request + request sent to server, wait for 2 server responses
+  (let [resp (SpecialHttpClient/http10 "http://localhost:4347/")]
+    (is (re-find #"200" resp))
+    (is (re-find #"Keep-Alive" resp))))
+
+(deftest test-ipv6
+  ;; TODO add more
+  (is (= "hello world" (:body (http/get "http://[::1]:4347/")))))
+
 (deftest test-chunked-encoding
   (let [size 4194304
         resp (http/post "http://localhost:4347/chunked-input"
@@ -274,9 +314,54 @@
 
 ;;; start a test server, for test or benchmark
 (defonce tmp-server (atom nil))
+
 (defn -main [& args]
   (when-let [server @tmp-server]
     (server))
+  ;; start a jetty server with https for https client test
+  (run-jetty (site test-routes) {:port 14347
+                                 :join? false
+                                 :ssl-port 9898
+                                 :ssl? true
+                                 :key-password "123456"
+                                 :keystore "test/ssl_keystore"})
   (reset! tmp-server (run-server (site test-routes) {:port 9090
                                                      :queue-size 102400}))
   (println "server started at 0.0.0.0:9090"))
+
+;;; Test graceful shutdown
+(defn- slow-request-handler [sleep-time]
+  (fn [request]
+    (try
+      (Thread/sleep sleep-time) {:body "ok"}
+      (catch Exception e
+        {:status 500}))))
+
+(deftest test-get-local-port
+  (let [server (run-server (site test-routes) {:port 0})]
+    (is (> (:local-port (meta server)) 0))
+    (server)))
+
+(deftest test-immediate-close-kills-inflight-requests
+  (let [server (run-server (slow-request-handler 2000) {:port 3474})
+        resp (future (try (http/get "http://localhost:3474")
+                          (catch Exception e {:status "fail"})))]
+    (Thread/sleep 100)
+    (server)
+    (is (= "fail" (:status @resp)))))
+
+(deftest test-graceful-close-kills-long-inflight-requests
+  (let [server (run-server (slow-request-handler 2000) {:port 3474})
+        resp (future (try (http/get "http://localhost:3474")
+                          (catch Exception e {:status "fail"})))]
+    (Thread/sleep 100)
+    (server :timeout 100)
+    (is (= "fail" (:status @resp)))))
+
+(deftest test-graceful-close-responds-to-inflight-requests
+  (let [server (run-server (slow-request-handler 500) {:port 3474})
+        resp (future (try (http/get "http://localhost:3474")
+                          (catch Exception e {:status "fail"})))]
+    (Thread/sleep 100)
+    (server :timeout 3000)
+    (is (= 200 (:status @resp)))))

@@ -1,8 +1,8 @@
 package org.httpkit;
 
-import static java.lang.Character.isWhitespace;
-import static java.lang.Math.min;
-import static java.net.InetAddress.getByName;
+import clojure.lang.ISeq;
+import clojure.lang.PersistentList;
+import clojure.lang.Seqable;
 
 import java.io.*;
 import java.net.*;
@@ -10,13 +10,30 @@ import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.Charset;
+import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.Map.Entry;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import clojure.lang.ISeq;
-import clojure.lang.Seqable;
+import static java.lang.Character.isWhitespace;
+import static java.lang.Math.min;
+import static java.net.InetAddress.getByName;
+
+//  SimpleDateFormat is not thread safe
+class DateFormatter extends ThreadLocal<SimpleDateFormat> {
+    protected SimpleDateFormat initialValue() {
+        // Formats into HTTP date format (RFC 822/1123).
+        SimpleDateFormat f = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("GMT"));
+        return f;
+    }
+
+    private static final DateFormatter FORMATTER = new DateFormatter();
+
+    public static String getDate() {
+        return FORMATTER.get().format(new Date());
+    }
+}
 
 public class HttpUtils {
 
@@ -30,8 +47,6 @@ public class HttpUtils {
     public static final byte CR = 13; // \r
 
     public static final byte LF = 10; // \n
-
-    public static final int BUFFER_SIZE = 1024 * 64;
 
     // public static final int ABORT_PROCESSING = -1;
 
@@ -70,38 +85,6 @@ public class HttpUtils {
     // space ' '
     public static final byte SP = 32;
 
-    public static void encodeHeaders(DynamicBytes bytes, Map<String, Object> headers) {
-        for (Entry<String, Object> e : headers.entrySet()) {
-            String k = e.getKey();
-            Object v = e.getValue();
-            if (v instanceof String) {
-                bytes.append(k);
-                bytes.append(COLON);
-                bytes.append(SP);
-                // supposed to be ISO-8859-1, but utf-8 is compatible.
-                // filename in Content-Disposition can be utf8
-                bytes.append((String) v, HttpUtils.UTF_8);
-                bytes.append(CR);
-                bytes.append(LF);
-                // ring spec says it could be a seq
-            } else if (v instanceof Seqable) {
-                ISeq seq = ((Seqable) v).seq();
-                while (seq != null) {
-                    bytes.append(k);
-                    bytes.append(COLON);
-                    bytes.append(SP);
-                    bytes.append(seq.first().toString(), HttpUtils.UTF_8);
-                    bytes.append(CR);
-                    bytes.append(LF);
-                    seq = seq.next();
-                }
-            }
-        }
-
-        bytes.append(CR);
-        bytes.append(LF);
-    }
-
     public static ByteBuffer bodyBuffer(Object body) throws IOException {
         if (body == null) {
             return null;
@@ -122,6 +105,9 @@ public class HttpUtils {
                 seq = seq.next();
             }
             return ByteBuffer.wrap(b.get(), 0, b.length());
+            // makes ultimate optimization possible: no copy
+        } else if (body instanceof ByteBuffer) {
+            return (ByteBuffer) body;
         } else {
             throw new RuntimeException(body.getClass() + " is not understandable");
         }
@@ -141,20 +127,21 @@ public class HttpUtils {
                 e = true;
             } else {
                 switch (c) {
-                case '"':
-                case '%':
-                case '<':
-                case '>':
-                case '\\':
-                case '^':
-                case '`':
-                case '{':
-                case '}':
-                case '|':
-                    e = true;
-                    break;
-                default:
-                    e = false;
+                    case '"':
+                        // https://github.com/http-kit/http-kit/issues/70
+//                    case '%':
+                    case '<':
+                    case '>':
+                    case '\\':
+                    case '^':
+                    case '`':
+                    case '{':
+                    case '}':
+                    case '|':
+                        e = true;
+                        break;
+                    default:
+                        e = false;
                 }
             }
             if (e) {
@@ -168,9 +155,9 @@ public class HttpUtils {
         return new String(buffer.get(), 0, buffer.length(), UTF_8);
     }
 
-    public static int findEndOfString(String sb) {
+    public static int findEndOfString(String sb, int offset) {
         int result;
-        for (result = sb.length(); result > 0; result--) {
+        for (result = sb.length(); result > offset; result--) {
             if (!isWhitespace(sb.charAt(result - 1))) {
                 break;
             }
@@ -210,20 +197,8 @@ public class HttpUtils {
         try {
             return Integer.parseInt(hex, 16);
         } catch (Exception e) {
-            throw new ProtocolException("Expect chunk size to be a number: " + hex);
+            throw new ProtocolException("Expect chunk size to be a number, get" + hex);
         }
-    }
-
-    // HTTP header's key is Content-Type
-    public static Map<String, Object> camelCase(Map<String, Object> headers) {
-        TreeMap<String, Object> tmp = new TreeMap<String, Object>();
-
-        if (headers != null) {
-            for (Entry<String, Object> e : headers.entrySet()) {
-                tmp.put(HttpUtils.camelCase(e.getKey()), e.getValue());
-            }
-        }
-        return tmp;
     }
 
     // content-type => Content-Type
@@ -243,7 +218,7 @@ public class HttpUtils {
     }
 
     public static String getPath(URI uri) {
-        String path = encodeURI(uri.getPath());
+        String path = encodeURI(uri.getRawPath());
         String query = uri.getRawQuery();
         if ("".equals(path))
             path = "/";
@@ -322,6 +297,14 @@ public class HttpUtils {
         return bytes;
     }
 
+    public static String getStringValue(Map<String, Object> headers, String key) {
+        Object o = headers.get(key);
+        if (o instanceof String) {
+            return (String) o;
+        }
+        return null;
+    }
+
     public static void printError(String msg, Throwable t) {
         String error = String.format("%s [%s] ERROR - %s", new Date(), Thread.currentThread()
                 .getName(), msg);
@@ -332,7 +315,7 @@ public class HttpUtils {
         System.err.print(str.getBuffer().toString());
     }
 
-    public static void splitAndAddHeader(String sb, Map<String, String> headers) {
+    public static void splitAndAddHeader(String sb, Map<String, Object> headers) {
         final int length = sb.length();
         int nameStart;
         int nameEnd;
@@ -356,14 +339,24 @@ public class HttpUtils {
         }
 
         valueStart = findNonWhitespace(sb, colonEnd);
-        valueEnd = findEndOfString(sb);
+        valueEnd = findEndOfString(sb, valueStart);
 
         String key = sb.substring(nameStart, nameEnd);
         if (valueStart > valueEnd) { // ignore
             // logger.warn("header error: " + sb);
         } else {
             String value = sb.substring(valueStart, valueEnd);
-            headers.put(key.toLowerCase(), value);
+            key = key.toLowerCase();
+            Object v = headers.get(key);
+            if (v == null) {
+                headers.put(key, value);
+            } else {
+                if (v instanceof String) {
+                    headers.put(key, PersistentList.create(Arrays.asList((String) v, value)));
+                } else {
+                    headers.put(key, ((ISeq) v).cons(value));
+                }
+            }
         }
     }
 
@@ -405,9 +398,9 @@ public class HttpUtils {
     }
 
     // unit test in utils-test.clj
-    public static Charset detectCharset(Map<String, String> headers, DynamicBytes body) {
+    public static Charset detectCharset(Map<String, Object> headers, DynamicBytes body) {
         // 1. first from http header: Content-Type: text/html; charset=utf8
-        Charset result = parseCharset(headers.get(CONTENT_TYPE));
+        Charset result = parseCharset(getStringValue(headers, CONTENT_TYPE));
         if (result == null) {
             // 2. decode a little to find charset=???
             String s = new String(body.get(), 0, min(512, body.length()), ASCII);
@@ -426,5 +419,66 @@ public class HttpUtils {
         }
         // default utf8
         return result == null ? UTF_8 : result;
+    }
+
+    public static final String CL = "Content-Length";
+
+    public static ByteBuffer[] HttpEncode(int status, HeaderMap headers, Object body) {
+        ByteBuffer bodyBuffer;
+        try {
+            bodyBuffer = bodyBuffer(body);
+            // only write length if not chunked
+            if (!CHUNKED.equals(headers.get("Transfer-Encoding"))) {
+                if (bodyBuffer != null) {
+                    headers.put(CL, Integer.toString(bodyBuffer.remaining()));
+                } else {
+                    headers.put(CL, "0");
+                }
+            }
+        } catch (IOException e) {
+            byte[] b = e.getMessage().getBytes(ASCII);
+            status = 500;
+            headers.clear();
+            headers.put(CL, Integer.toString(b.length));
+            bodyBuffer = ByteBuffer.wrap(b);
+        }
+        headers.put("Server", "http-kit");
+        headers.put("Date", DateFormatter.getDate()); // rfc says the Date is needed
+
+        DynamicBytes bytes = new DynamicBytes(196);
+        byte[] bs = HttpStatus.valueOf(status).getInitialLineBytes();
+        bytes.append(bs, bs.length);
+        headers.encodeHeaders(bytes);
+        ByteBuffer headBuffer = ByteBuffer.wrap(bytes.get(), 0, bytes.length());
+
+        if (bodyBuffer != null)
+            return new ByteBuffer[]{headBuffer, bodyBuffer};
+        else
+            return new ByteBuffer[]{headBuffer};
+    }
+
+    public static ByteBuffer WsEncode(byte opcode, byte[] data, int length) {
+        byte b0 = 0;
+        b0 |= 1 << 7; // FIN
+        b0 |= opcode;
+        ByteBuffer buffer = ByteBuffer.allocate(length + 10); // max
+        buffer.put(b0);
+
+        if (length <= 125) {
+            buffer.put((byte) (length));
+        } else if (length <= 0xFFFF) {
+            buffer.put((byte) 126);
+            buffer.putShort((short) length);
+        } else {
+            buffer.put((byte) 127);
+            buffer.putLong(length);
+        }
+        buffer.put(data, 0, length);
+        buffer.flip();
+        return buffer;
+    }
+
+    public static ByteBuffer WsEncode(byte opcode, byte[] data) {
+        return WsEncode(opcode, data, data.length);
     }
 }
